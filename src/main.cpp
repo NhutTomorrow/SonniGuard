@@ -402,17 +402,17 @@ void setup()
 
   iotQueue = xQueueCreate(IOT_QUEUE_LENGTH, sizeof(DataPacket));
 
-  waitForSubjectID();
+  // waitForSubjectID();
 
-  xTaskCreatePinnedToCore(
-      IoTCoreUploadTask,
-      "IoTCoreTask",
-      8192,
-      (void *)iotQueue, // truyền queue handle vào task
-      1,
-      NULL,
-      0 // CORE 0
-  );
+  // xTaskCreatePinnedToCore(
+  //     IoTCoreUploadTask,
+  //     "IoTCoreTask",
+  //     8192,
+  //     (void *)iotQueue, // truyền queue handle vào task
+  //     1,
+  //     NULL,
+  //     0 // CORE 0
+  // );
 
   Serial.println("Hệ thống sẵn sàng. Nhập số ID trên Serial để đổi Subject_ID.");
   Serial.println("Format CSV: Subject_ID, Timestamp_ms, RawRed, RawIR, R_Value, SpO2, BPM");
@@ -425,18 +425,18 @@ void setup()
 void loop()
 {
   // Đổi Subject ID qua Serial
-  if (Serial.available() > 0)
-  {
-    int inputID = Serial.parseInt();
-    if (inputID > 0)
-    {
-      subjectID = inputID;
-      while (Serial.available() > 0)
-        Serial.read();
-      Serial.print("✓ Đã đổi Subject ID thành: ");
-      Serial.println(subjectID);
-    }
-  }
+  // if (Serial.available() > 0)
+  // {
+  //   int inputID = Serial.parseInt();
+  //   if (inputID > 0)
+  //   {
+  //     subjectID = inputID;
+  //     while (Serial.available() > 0)
+  //       Serial.read();
+  //     Serial.print("✓ Đã đổi Subject ID thành: ");
+  //     Serial.println(subjectID);
+  //   }
+  // }
 
   ppgSensor_process(subjectID, iotQueue);
 }
