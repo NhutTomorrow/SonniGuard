@@ -25,6 +25,10 @@ static const float LPF_BETA = 0.8f;
 static float dc_track_red = 0, dc_track_ir = 0; // gia tri mat nuoc hay duong nen
 static float lpf_red_prev = 0, lpf_ir_prev = 0;
 
+// Công thức: SpO2 = A - B*R - C*R^2
+static const float SPO2_A = 100.0f;
+static const float SPO2_B = -2.50f;
+static const float SPO2_C = 18.75f;
 // --- KẾT QUẢ ĐẦU RA ---
 static float final_R = 0.0f;
 static float final_SpO2 = 98.0f;
@@ -47,11 +51,14 @@ static int bpmHistory[BPM_FILTER_SIZE] = {75, 75, 75, 75, 75};
 static int bpmIndex = 0;
 static int smoothed_BPM = 75;
 
-static float acIR_max = 0;
-static float acIR_min = 0;
-static float beat_threshold = 0;
-static unsigned long lastBeatSampleCount = 0;
+static float local_acIR_min = 0.0f;
+static float beat_threshold = -150.0f; // Khởi tạo an toàn (giá trị âm cho đáy sóng)
+static unsigned long samplesSinceLastBeat = 0;
 
+// biến sử dụng để ACG LED Red và IR
+static uint8_t current_red_amp = 60; // Dòng khởi tạo ban đầu cho LED RED
+static uint8_t current_ir_amp = 70;  // Dòng khởi tạo ban đầu cho LED IR
+static int agc_cooldown_counter = 0; // Bộ trễ khóa tuyến tính chống quét liên tục
 void ppgSensor_init()
 {
     for (int i = 0; i < BPM_FILTER_SIZE; i++)
@@ -66,8 +73,8 @@ void ppgSensor_init()
 
     // ĐÃ ĐÚNG: Cấu hình phần cứng chạy chuẩn 50Hz đồng bộ phần mềm
     ppgSensor.setup(35, 1, 2, 50, 215, 4096);
-    ppgSensor.setPulseAmplitudeRed(45);
-    ppgSensor.setPulseAmplitudeIR(65);
+    ppgSensor.setPulseAmplitudeRed(current_red_amp);
+    ppgSensor.setPulseAmplitudeIR(current_ir_amp);
 }
 
 void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
@@ -83,7 +90,7 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
     uint32_t rawIR = ppgSensor.getIR();
 
     // KIỂM TRA TAY RA KHỎI CẢM BIẾN
-    if (rawIR < 50000)
+    if (rawIR < 50000 || rawRed < 50000)
     {
         sampleCount = 0;
         strideCounter = 0;
@@ -91,22 +98,10 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
         isBufferFull = false;
         isFingerAttached = false;
         bpmState = BPM_STATE_WAIT_FOR_DIP; // Reset luôn trạng thái FSM nhịp tim
+        Serial.println("❌ Tín hiệu PPG bị bão hòa hoặc mất dấu! Vui lòng đặt lại ngón tay.");
         return;
     }
-    // Serial.print(subjectID);
-    // Serial.print(",");
-    // Serial.print(now);
-    // Serial.print(",");
-    // Serial.print(rawRed);
-    // Serial.print(",");
-    // Serial.print(rawIR);
-    // Serial.print(",");
-    // Serial.print(final_R, 4);
-    // Serial.print(",");
-    // Serial.print(final_SpO2, 1);
-    // Serial.print(",");
-    // Serial.println(smoothed_BPM);
-    // KHỞI TẠO NHANH ĐƯỜNG NỀN DC
+
     if (!isFingerAttached)
     {
         dc_track_red = (float)rawRed;
@@ -114,6 +109,7 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
         lpf_red_prev = 0.0f;
         lpf_ir_prev = 0.0f;
         isFingerAttached = true;
+        Serial.println("✅ Đã phát hiện tín hiệu PPG! Vui lòng giữ nguyên vị trí.");
         return;
     }
 
@@ -135,54 +131,45 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
     // ------------------------------------------
     // 2. VÁ LỖI: BPM (MÁY TRẠNG THÁI SĂN ĐÁY SÓNG ĐỒNG BỘ 50HZ)
     // ------------------------------------------
-    lastBeatSampleCount++;
+    samplesSinceLastBeat++;
 
-    if (acIR_filtered > acIR_max)
-        acIR_max = acIR_filtered;
-    if (acIR_filtered < acIR_min)
-        acIR_min = acIR_filtered;
-
-    // Cứ sau mỗi 1 giây (50 mẫu), cập nhật đường ngưỡng động dựa trên đáy thực tế
-    if (strideCounter == 0)
+    // Liên tục theo dõi điểm cực tiểu âm của cửa sổ hiện tại để tự cứu hộ nếu mất dấu tín hiệu
+    if (acIR_filtered < local_acIR_min)
     {
-        beat_threshold = acIR_min * 0.55f; // Đặt ngưỡng an toàn bằng 55% biên độ âm đáy
-        acIR_max = 0;
-        acIR_min = 0;
+        local_acIR_min = acIR_filtered;
     }
 
     switch (bpmState)
     {
     case BPM_STATE_WAIT_FOR_DIP:
-        // Nếu sóng lao xuống sâu hơn đường ngưỡng động VÀ đã qua thời gian chặn nhiễu (300ms = 15 mẫu)
-        if (acIR_filtered < beat_threshold && lastBeatSampleCount > 15)
+        // Sóng lao xuống sâu hơn đường ngưỡng động (giá trị âm) VÀ qua thời gian chặn nhiễu sinh học (300ms = 15 mẫu)
+        if (acIR_filtered < beat_threshold && samplesSinceLastBeat > 15)
         {
             bpmState = BPM_STATE_HUNTING_VALLEY;
-            valley_min_val = acIR_filtered; // Tạm khóa mẫu này làm đáy
+            valley_min_val = acIR_filtered;
             valley_min_time = now;
         }
         break;
 
     case BPM_STATE_HUNTING_VALLEY:
-        // Nếu sóng vẫn tiếp tục lao xuống sâu hơn, cập nhật mốc đáy thực tế mới
+        // Nếu sóng vẫn đang tiếp tục đi xuống âm sâu hơn, khóa mục tiêu đáy mới
         if (acIR_filtered < valley_min_val)
         {
             valley_min_val = acIR_filtered;
-            valley_min_time = now; // Khóa chặt thời gian thực của ĐÁY THẬT y khoa
+            valley_min_time = now;
         }
 
-        // DẤU HIỆU QUAY ĐẦU: Sóng đi ngược lên vượt qua đáy một biên độ trễ (Hysteresis = 20.0f) để chặn nhiễu răng cưa
-        float hysteresis_margin = 20.0f;
-        if (acIR_filtered > (valley_min_val + hysteresis_margin))
+        // DẤU HIỆU QUAY ĐẦU CHẮC CHẮN Y KHOA: Sóng đi lên vượt qua đáy một khoảng trễ chống răng cưa (Hysteresis = 25.0f)
+        if (acIR_filtered > (valley_min_val + 25.0f))
         {
-            // CHỐT MỤC TIÊU: Điểm valley_min_time chính là đáy thật!
-            long delta = valley_min_time - lastBeatTime;
+            long delta_time = valley_min_time - lastBeatTime;
 
-            // Bộ lọc cửa sổ sinh học (Chấp nhận nhịp tim từ 40 đến 160 BPM)
-            if (delta > 375 && delta < 1500)
+            // BỘ LỌC SINH HỌC LÂM SÀNG: Chỉ chấp nhận tính toán nếu nằm trong dải [40, 160] BPM
+            if (delta_time > 375 && delta_time < 1500)
             {
-                lastBeatTime = valley_min_time;
-                float instant_bpm = 60000.0f / (float)delta;
+                float instant_bpm = 60000.0f / (float)delta_time;
 
+                // Bộ lọc trung bình trượt làm mịn BPM
                 bpmHistory[bpmIndex] = (int)instant_bpm;
                 bpmIndex = (bpmIndex + 1) % BPM_FILTER_SIZE;
 
@@ -192,13 +179,38 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
                 smoothed_BPM = bpmSum / BPM_FILTER_SIZE;
             }
 
-            // Quay xe về trạng thái chờ xung máu tiếp theo
-            lastBeatSampleCount = 0;
+            // =================================================================
+            // SỬA LỖI CHÍ MẠCH 1: ĐƯA ĐOẠN ĐỒNG BỘ THỜI GIAN VÀ NGƯỠNG RA NGOÀI LỌC SINH HỌC
+            // Đảm bảo nhịp tiếp theo sẽ được tính toán dựa trên mốc thời gian của nhịp vừa tìm thấy này!
+            // =================================================================
+            lastBeatTime = valley_min_time;
+            beat_threshold = valley_min_val * 0.60f; // Cập nhật ngưỡng động thích ứng beat-by-beat
+            local_acIR_min = 0.0f;                   // Reset bộ cứu hộ
+
+            samplesSinceLastBeat = 0;
             bpmState = BPM_STATE_WAIT_FOR_DIP;
         }
         break;
     }
 
+    // Tự động cứu hộ: Nếu quá 2 giây không tìm thấy nhịp (Do người dùng di chuyển tay hoặc vừa khởi động)
+    if (samplesSinceLastBeat > 100)
+    {
+        beat_threshold = local_acIR_min * 0.5f; // Ép hạ ngưỡng xuống để bắt lại sóng
+        if (beat_threshold > -20.0f)
+            beat_threshold = -50.0f; // Ngưỡng sàn bảo vệ
+
+        local_acIR_min = 0.0f;
+        samplesSinceLastBeat = 0;
+
+        // =================================================================
+        // SỬA LỖI CHÍ MẠCH 2: ĐỒNG BỘ LẠI MỐC THỜI GIAN KHI HỆ THỐNG TỰ CỨU HỘ
+        // Ép trục thời gian đồng bộ về hiện tại để tránh cú nhảy Delta_time ở nhịp kế tiếp
+        // =================================================================
+        lastBeatTime = now;
+
+        bpmState = BPM_STATE_WAIT_FOR_DIP;
+    }
     // ------------------------------------------
     // 3. Cập Nhật Mảng Vòng Tròn (Sliding Window)
     // ------------------------------------------
@@ -239,22 +251,10 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
         float avg_dc_red = sum_dc_red / (float)WINDOW_SIZE;
         float avg_dc_ir = sum_dc_ir / (float)WINDOW_SIZE;
 
-        Serial.print("rmsRed:");
-        Serial.print(rmsRed);
-        Serial.print(",");
-        Serial.print("dcRed:");
-        Serial.print(avg_dc_red);
-        Serial.print(",");
-        Serial.print("rmsIR:");
-        Serial.print(rmsIR);
-        Serial.print(",");
-        Serial.print("dcIR:");
-        Serial.println(avg_dc_ir);
-
         if (rmsIR > 0.0f && avg_dc_red > 0.0f && avg_dc_ir > 0.0f)
         {
             final_R = (rmsRed / avg_dc_red) / (rmsIR / avg_dc_ir);
-            float instant_SpO2 = 108.0f - 19.23f * final_R;
+            float instant_SpO2 = SPO2_A - (SPO2_B * final_R) - (SPO2_C * final_R * final_R);
 
             if (instant_SpO2 > 100.0f)
                 instant_SpO2 = 100.0f;
@@ -287,5 +287,59 @@ void ppgSensor_process(int subjectID, QueueHandle_t iotQueue)
         Serial.print(final_SpO2, 1);
         Serial.print(",");
         Serial.println(smoothed_BPM);
+
+        if (agc_cooldown_counter == 0)
+        {
+            bool is_hardware_adjusted = false;
+            if (rawRed > 180000 && current_red_amp > 5)
+            {
+                current_red_amp -= 2;
+                is_hardware_adjusted = true;
+            }
+            else if (rawRed < 145000 && current_red_amp < 250)
+            {
+                current_red_amp += 2;
+                is_hardware_adjusted = true;
+            }
+            if (rawIR > 180000 && current_ir_amp > 5)
+            {
+                current_ir_amp -= 2;
+                is_hardware_adjusted = true;
+            }
+            else if (rawIR < 145000 && current_ir_amp < 250)
+            {
+                current_ir_amp += 2;
+                is_hardware_adjusted = true;
+            }
+            if (is_hardware_adjusted)
+            {
+                ppgSensor.setPulseAmplitudeRed(current_red_amp);
+                ppgSensor.setPulseAmplitudeIR(current_ir_amp);
+
+                agc_cooldown_counter = 3; // cho led 3 chu ki de on dinh
+            }
+        }
+        else if (agc_cooldown_counter > 0)
+        {
+            agc_cooldown_counter--;
+        }
+
+        Serial.print("rmsRed:");
+        Serial.print(rmsRed);
+        Serial.print(",");
+        Serial.print("dcRed:");
+        Serial.print(avg_dc_red);
+        Serial.print(",");
+        Serial.print("rmsIR:");
+        Serial.print(rmsIR);
+        Serial.print(",");
+        Serial.print("dcIR:");
+        Serial.print(avg_dc_ir);
+        Serial.print(",");
+        Serial.print("Amp Led RED:");
+        Serial.print(current_red_amp);
+        Serial.print(", ");
+        Serial.print("Amp Led IR");
+        Serial.println(current_ir_amp);
     }
 }
