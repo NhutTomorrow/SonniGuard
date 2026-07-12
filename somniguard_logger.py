@@ -7,7 +7,7 @@ import os
 # ==============================================================================
 # Windows: Thường là 'COM3', 'COM4',... Kiểm tra trong Device Manager hoặc Arduino IDE
 # Linux/Mac: Thường là '/dev/ttyUSB0' hoặc '/dev/tty.usbserial-...'
-PORT_NAME = 'COM10'  
+PORT_NAME = 'COM12'  
 BAUD_RATE = 115200  # Đảm bảo trùng với Baudrate trong code C của Đức Tài
 OUTPUT_FILE = 'somniguard_log.csv'
 
