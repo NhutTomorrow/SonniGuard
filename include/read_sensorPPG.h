@@ -24,4 +24,6 @@ void ppgSensor_init();
  * @param subjectID  ID đối tượng đo hiện tại
  * @param iotQueue   Handle của FreeRTOS queue để gửi DataPacket
  */
-void ppgSensor_process(int subjectID, QueueHandle_t iotQueue);
+void ppgSensor_process(void *pvParameters);
+
+void ppg_RawData(void *pvParameters);
